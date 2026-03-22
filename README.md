@@ -1,1 +1,1 @@
-oso# WeightFromPhoto
+ooso# WeightFromPhoto
