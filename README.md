@@ -1,1 +1,0 @@
-ooooooooooooooooooooooooooooooooooooooooooooooooooooooooooso# WeightFromPhoto
