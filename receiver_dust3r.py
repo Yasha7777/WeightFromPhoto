@@ -20,7 +20,6 @@ HEADERS_JSON = {
 }
 
 # Название бакета в Supabase Storage
-# Создайте его вручную в Supabase Dashboard → Storage → New bucket → "dust3r-ply" (public)
 PLY_BUCKET = "dust3r-ply"
 
 
@@ -45,60 +44,67 @@ async def download_image(photo_id: str, save_path: str):
 
 
 # ---------------------------------------------------------------------------
-# Загрузка PLY в Supabase Storage + запись ссылки в таблицу
+# ИЗМЕНЕНО: Универсальная функция загрузки файлов в Supabase Storage
 # ---------------------------------------------------------------------------
 
-async def upload_ply_to_supabase(analysis_id: str, ply_path: str) -> Optional[str]:
+async def upload_to_supabase_storage(analysis_id: str, file_path: str, filename: str, content_type: str) -> Optional[str]:
     """
-    Загружает .ply файл в бакет dust3r-ply и возвращает публичную ссылку.
-    Также записывает ссылку в таблицу dust3r_results (создайте её заранее — см. ниже).
-
-    SQL для создания таблицы:
-        CREATE TABLE dust3r_results (
-            id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-            analysis_id UUID NOT NULL,
-            ply_url     TEXT NOT NULL,
-            created_at  TIMESTAMPTZ DEFAULT NOW()
-        );
-
-    Бакет: Supabase Dashboard → Storage → New bucket → Name: "dust3r-ply", Public: ON
+    Загружает указанный файл в бакет dust3r-ply и возвращает публичную ссылку.
     """
-    storage_path = f"{analysis_id}/dust3r_output.ply"
+    storage_path = f"{analysis_id}/{filename}"
     upload_url   = f"{SUPABASE_URL}/storage/v1/object/{PLY_BUCKET}/{storage_path}"
     public_url   = f"{SUPABASE_URL}/storage/v1/object/public/{PLY_BUCKET}/{storage_path}"
 
     try:
-        with open(ply_path, "rb") as f:
-            ply_bytes = f.read()
+        with open(file_path, "rb") as f:
+            file_bytes = f.read()
 
-        print(f"[DUSt3R] Uploading PLY to Supabase Storage "
-              f"({len(ply_bytes)//1024//1024} MB)...")
+        print(f"[DUSt3R] Uploading {filename} to Supabase Storage ({len(file_bytes)//1024} KB)...")
 
         async with httpx.AsyncClient() as client:
-            # 1. Загружаем файл
             upload_resp = await client.post(
                 upload_url,
-                content=ply_bytes,
+                content=file_bytes,
                 headers={
                     "apikey":          SUPABASE_KEY,
                     "Authorization":   f"Bearer {SUPABASE_KEY}",
-                    "Content-Type":    "application/octet-stream",
-                    "x-upsert":        "true",   # перезаписать если уже есть
+                    "Content-Type":    content_type,
+                    "x-upsert":        "true",
                 },
                 timeout=120.0,
             )
 
             if upload_resp.status_code not in (200, 201):
-                print(f"[DUSt3R] PLY upload failed: {upload_resp.status_code} {upload_resp.text}")
+                print(f"[DUSt3R] {filename} upload failed: {upload_resp.status_code} {upload_resp.text}")
                 return None
 
-            print(f"[DUSt3R] PLY uploaded -> {public_url}")
+            print(f"[DUSt3R] {filename} uploaded -> {public_url}")
+            return public_url
 
-            # 2. Записываем ссылку в таблицу dust3r_results
+    except Exception as e:
+        print(f"[DUSt3R] {filename} upload error: {e}")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# ДОБАВЛЕНО: Функция записи ссылок результатов в базу данных
+# ---------------------------------------------------------------------------
+
+async def save_results_to_db(analysis_id: str, ply_url: Optional[str], glb_url: Optional[str]):
+    """
+    Делает одну запись в таблицу dust3r_results, содержащую ссылки на оба файла.
+    """
+    payload = {"analysis_id": analysis_id}
+    if ply_url:
+        payload["ply_url"] = ply_url
+    if glb_url:
+        payload["glb_url"] = glb_url
+
+    try:
             db_resp = await client.post(
                 f"{SUPABASE_URL}/rest/v1/dust3r_results",
                 headers=HEADERS_JSON,
-                json={"analysis_id": analysis_id, "ply_url": public_url},
+                json=payload,
                 timeout=10.0,
             )
 
@@ -106,12 +112,8 @@ async def upload_ply_to_supabase(analysis_id: str, ply_path: str) -> Optional[st
                 print(f"[DUSt3R] DB record saved for analysis {analysis_id}")
             else:
                 print(f"[DUSt3R] DB write warning: {db_resp.status_code} {db_resp.text}")
-
-        return public_url
-
     except Exception as e:
-        print(f"[DUSt3R] PLY upload error: {e}")
-        return None
+        print(f"[DUSt3R] DB write error: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -158,9 +160,19 @@ async def trigger_dust3r(request: Request):
         exif_json_path = os.path.join(project_dir, "exif.json")
         with open(exif_json_path, "w") as f:
             json.dump(exif_raw, f)
-        first = exif_raw[0].get("exif", exif_raw[0])
-        print(f"[DUSt3R] EXIF saved: focal_real={first.get('focal_real')}mm "
-              f"orig={first.get('orig_width')}x{first.get('orig_height')}")
+    
+        first_entry = exif_raw[0] if exif_raw else None
+        first = None
+        if isinstance(first_entry, dict):
+            first = first_entry.get("exif") or first_entry
+            if not isinstance(first, dict):
+                first = None
+    
+        if first:
+            print(f"[DUSt3R] EXIF saved: focal_real={first.get('focal_real')}mm "
+                  f"orig={first.get('orig_width')}x{first.get('orig_height')}")
+        else:
+            print(f"[DUSt3R] EXIF saved: {len(exif_raw)} entries, no focal/GPS metadata")
 
     # --- Скачиваем фото ---
     print("[DUSt3R] Downloading photos...")
@@ -187,42 +199,51 @@ async def trigger_dust3r(request: Request):
         with open(result_json_path) as f:
             gpu_result = json.load(f)
 
-    # --- Загружаем PLY в Supabase Storage ---
+    # --- ИЗМЕНЕНО: Загружаем файлы в Supabase Storage ---
     ply_url = None
     if os.path.exists(output_ply):
-        ply_url = await upload_ply_to_supabase(analysis_id, output_ply)
+        ply_url = await upload_to_supabase_storage(
+            analysis_id, output_ply, "dust3r_output.ply", "application/octet-stream"
+        )
+
+    # ДОБАВЛЕНО: Загрузка GLB меша
+    output_glb = output_ply.replace(".ply", ".glb")
+    glb_url = None
+    if os.path.exists(output_glb):
+        glb_url = await upload_to_supabase_storage(
+            analysis_id, output_glb, "dust3r_output.glb", "model/gltf-binary"
+        )
+
+    # ДОБАВЛЕНО: Сохраняем ссылки в БД одной транзакцией
+    if ply_url or glb_url:
+        await save_results_to_db(analysis_id, ply_url, glb_url)
 
     # --- Формируем ответ для n8n ---
     result = {
         "status":              "success",
         "analysis_id":         analysis_id,
         "point_count":         gpu_result.get("point_count"),
-
-        # Масштаб (обе версии, подробнее в документации)
-        "scale_weighted":      gpu_result.get("scale_weighted"),   # топ-30% длинных GPS-пар
-        "scale_median":        gpu_result.get("scale_median"),     # медиана всех GPS-пар
-
-        # Объём в единицах DUSt3R (не зависит от GPS, стабилен)
+        "scale_weighted":      gpu_result.get("scale_weighted"),
+        "scale_median":        gpu_result.get("scale_median"),
         "volume_dust3r_units": gpu_result.get("volume_dust3r_units"),
-
-        # Объём в м³ через weighted масштаб
         "volume_m3_weighted":  gpu_result.get("volume_m3_weighted"),
-
-        # Объём в м³ через медианный масштаб
         "volume_m3_median":    gpu_result.get("volume_m3_median"),
-
-        # Ссылка на PLY файл для просмотра на сайте
+        
+        # Ссылки на файлы для фронтенда
         "ply_url":             ply_url,
         "ply_file":            output_ply,
+        "glb_url":             glb_url,   # ДОБАВЛЕНО
+        "glb_file":            output_glb,  # ДОБАВЛЕНО
     }
 
     v_w = result.get("volume_m3_weighted")
     v_m = result.get("volume_m3_median")
     if v_w is not None:
         print(f"[DUSt3R] Volume weighted: {v_w} m3 | median: {v_m} m3")
-        print(f"[DUSt3R] WARNING: GPS accuracy ~3-6m, volume error can be up to 4x")
     if ply_url:
         print(f"[DUSt3R] PLY URL: {ply_url}")
+    if glb_url:
+        print(f"[DUSt3R] GLB URL: {glb_url}")  # ДОБАВЛЕНО
 
     return result
 

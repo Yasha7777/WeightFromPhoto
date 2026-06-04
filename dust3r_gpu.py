@@ -13,6 +13,14 @@ from dust3r.utils.image import load_images
 from dust3r.image_pairs import make_pairs
 from dust3r.cloud_opt import global_aligner, GlobalAlignerMode
 
+# ДОБАВИТЬ: импорт для создания mesh
+try:
+    import open3d as o3d
+    OPEN3D_AVAILABLE = True
+except ImportError:
+    OPEN3D_AVAILABLE = False
+    print("[DUSt3R_GPU] Warning: open3d not installed, GLB generation disabled")
+
 
 def haversine_distance_m(lat1, lon1, lat2, lon2):
     R = 6_371_000.0
@@ -24,12 +32,6 @@ def haversine_distance_m(lat1, lon1, lat2, lon2):
 def compute_scale_from_gps(gps_coords, cam_centers):
     """
     Returns (scale_weighted, scale_median) in m/unit.
-
-    scale_weighted  - weighted average over longest GPS pairs (top 30%, weight=GPS dist).
-                      More resistant to short noisy pairs.
-    scale_median    - simple median over all pairs.
-                      Included for reference; GPS accuracy ~3-6m means both values
-                      carry ~60% error, which becomes ~4x error in volume (error^3).
     """
     N = len(gps_coords)
     if N < 2:
@@ -75,7 +77,13 @@ def compute_scale_from_gps(gps_coords, cam_centers):
 
 def focal_px_from_exif(exif_list, dust3r_img_size=512):
     for entry in exif_list:
+        if not isinstance(entry, dict):
+            continue
         e = entry.get("exif", entry)
+        if not isinstance(e, dict):
+            e = entry
+        if not isinstance(e, dict):
+            continue
         focal_real = e.get("focal_real")
         focal_35mm = e.get("focal_35mm")
         orig_w     = e.get("orig_width")
@@ -117,11 +125,76 @@ def save_ply(filepath, pts, colors):
                     f"{int(c[0])} {int(c[1])} {int(c[2])}\n")
 
 
+# ДОБАВЛЕНА НОВАЯ ФУНКЦИЯ: конвертация point cloud в mesh (GLB) через Poisson
+def pointcloud_to_mesh(pts, colors, output_glb_path, simplify=False, target_faces=20000):
+    """
+    Convert point cloud to mesh using Poisson Surface Reconstruction.
+    Returns path to GLB file.
+    """
+    if not OPEN3D_AVAILABLE:
+        print("[DUSt3R_GPU] open3d not installed, skipping mesh generation")
+        return None
+    
+    print(f"[DUSt3R_GPU] Creating mesh from {len(pts)} points using Poisson...")
+    
+    # Создаем point cloud в open3d
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(pts)
+    pcd.colors = o3d.utility.Vector3dVector(colors / 255.0)
+    
+    # 1. Удаляем выбросы (летящий мусор)
+    cl, ind = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+    pcd = pcd.select_by_index(ind)
+    print(f"[DUSt3R_GPU] After outlier removal: {len(pcd.points)} points")
+    
+    # 2. Вычисляем нормали (жизненно важно для Пуассона)
+    pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30))
+    pcd.orient_normals_consistent_tangent_plane(k=15)
+    
+    # 3. Реконструкция Пуассона (depth=9 дает хорошую детализацию, можно увеличить до 10)
+    print("[DUSt3R_GPU] Running Poisson reconstruction...")
+    mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=9)
+    
+    # 4. Удаление лишней сетки (отрезаем "пузырь")
+    densities = np.asarray(densities)
+    density_threshold = np.quantile(densities, 0.05)
+    vertices_to_remove = densities < density_threshold
+    mesh.remove_vertices_by_mask(vertices_to_remove)
+    
+    # 5. Перенос цвета с точек на полигоны
+    print("[DUSt3R_GPU] Transferring colors...")
+    kdtree = o3d.geometry.KDTreeFlann(pcd)
+    mesh_colors = []
+    for v in np.asarray(mesh.vertices):
+        _, idx, _ = kdtree.search_knn_vector_3d(v, 1)
+        mesh_colors.append(np.asarray(pcd.colors)[idx[0]])
+    mesh.vertex_colors = o3d.utility.Vector3dVector(np.vstack(mesh_colors))
+    
+    # 6. --- ФИКС ПЕРЕВЕРНУТОСТИ ---
+    # Поворачиваем меш на 180 градусов вокруг оси X.
+    R = mesh.get_rotation_matrix_from_xyz((np.pi, 0, 0))
+    mesh.rotate(R, center=mesh.get_center())
+
+    # 7. --- ФИКС "БЕЛЕСОСТИ" И МАТОВОСТИ (Гамма-коррекция) ---
+    # Делаем цвета чуть темнее и насыщеннее (возводим в степень 1.5)
+    mesh_colors_np = np.asarray(mesh.vertex_colors)
+    mesh_colors_np = np.power(mesh_colors_np, 1.5) 
+    mesh.vertex_colors = o3d.utility.Vector3dVector(mesh_colors_np)
+    
+    # 8. Сохраняем как GLB
+    o3d.io.write_triangle_mesh(output_glb_path, mesh, write_ascii=False, compressed=True)
+    print(f"[DUSt3R_GPU] Mesh saved to {output_glb_path} ({len(mesh.triangles)} faces)")
+    
+    return output_glb_path
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--image_dir", required=True)
     parser.add_argument("--output",    required=True)
     parser.add_argument("--exif_json", default=None)
+    # ДОБАВЛЕН НОВЫЙ ПАРАМЕТР: генерировать ли GLB
+    parser.add_argument("--no_glb",    action="store_true", help="Skip GLB mesh generation")
     args = parser.parse_args()
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -154,7 +227,13 @@ def main():
         sorted_exif = sorted(exif_list, key=lambda e: e.get("photo_index", 0))
         gps_list = []
         for entry in sorted_exif:
+            if not isinstance(entry, dict):
+                continue
             inner = entry.get("exif", entry)
+            if not isinstance(inner, dict):
+                inner = entry
+            if not isinstance(inner, dict):
+                continue
             lat = inner.get("lat")
             lon = inner.get("lon")
             if lat is not None and lon is not None:
@@ -194,6 +273,9 @@ def main():
     masks_np = [m.detach().cpu().numpy() for m in masks]
 
     all_pts, all_colors = [], []
+    total_before = sum(m.size for m in masks_np)
+    total_after  = sum(m.sum() for m in masks_np)
+    print(f"[DUSt3R_GPU] Masks: {total_after}/{total_before} points passed confidence filter")
     for i in range(len(pts3d_np)):
         mask = masks_np[i]
         all_pts.append(pts3d_np[i][mask])
@@ -236,7 +318,7 @@ def main():
 
     # 9. Save PLY
     save_ply(args.output, final_pts, final_colors)
-
+    
     # 10. Read PLY as base64 to pass back via JSON
     ply_base64 = None
     try:
@@ -245,8 +327,29 @@ def main():
         print(f"[DUSt3R_GPU] PLY encoded to base64 ({len(ply_base64)//1024} KB)")
     except Exception as e:
         print(f"[DUSt3R_GPU] PLY base64 error: {e}")
+    
+    # 11. ДОБАВЛЕНО: Generate GLB mesh
+    glb_base64 = None
+    glb_file_path = None
+    
+    if not args.no_glb and OPEN3D_AVAILABLE and len(final_pts) > 1000:
+        try:
+            glb_file_path = args.output.replace(".ply", ".glb")
+            pointcloud_to_mesh(final_pts, final_colors, glb_file_path, simplify=True)
+            
+            # Read and encode GLB as base64
+            with open(glb_file_path, "rb") as f:
+                glb_base64 = base64.b64encode(f.read()).decode("utf-8")
+            print(f"[DUSt3R_GPU] GLB encoded to base64 ({len(glb_base64)//1024} KB)")
+        except Exception as e:
+            print(f"[DUSt3R_GPU] GLB generation error: {e}")
+            glb_base64 = None
+    elif not args.no_glb and not OPEN3D_AVAILABLE:
+        print("[DUSt3R_GPU] Skipping GLB: open3d not available")
+    elif not args.no_glb and len(final_pts) <= 1000:
+        print(f"[DUSt3R_GPU] Skipping GLB: too few points ({len(final_pts)}) for mesh")
 
-    # 11. Result JSON
+    # 12. Result JSON (ДОБАВЛЕНО поле glb_base64)
     result = {
         "status":              "success",
         "point_count":         len(final_pts),
@@ -257,13 +360,15 @@ def main():
         "volume_m3_median":    round(volume_m3_med,  3) if volume_m3_med  is not None else None,
         "ply_file":            args.output,
         "ply_base64":          ply_base64,
+        "glb_file":            glb_file_path,      # ДОБАВЛЕНО
+        "glb_base64":          glb_base64          # ДОБАВЛЕНО
     }
     result_path = args.output.replace(".ply", "_result.json")
     with open(result_path, 'w') as f:
         json.dump(result, f, indent=2)
     print(f"[DUSt3R_GPU] Result: {result_path}")
-    # Print result without base64 blob for clean logs
-    log_result = {k: v for k, v in result.items() if k != "ply_base64"}
+    # Print result without base64 blobs for clean logs
+    log_result = {k: v for k, v in result.items() if k not in ["ply_base64", "glb_base64"]}
     print(json.dumps(log_result))
     print("[DUSt3R_GPU] Done!")
 
