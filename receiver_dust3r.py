@@ -27,20 +27,24 @@ PLY_BUCKET = "dust3r-ply"
 # Скачивание фото из Supabase
 # ---------------------------------------------------------------------------
 
-async def download_image(photo_id: str, save_path: str):
-    async with httpx.AsyncClient() as client:
-        db_url = f"{SUPABASE_URL}/rest/v1/colmap_photos?id=eq.{photo_id}&select=public_url"
-        db_resp = await client.get(db_url, headers=HEADERS_JSON, timeout=10.0)
-        if db_resp.status_code != 200 or not db_resp.json():
-            raise Exception(f"Photo {photo_id} not found (status {db_resp.status_code})")
-        image_url = db_resp.json()[0].get("public_url")
-        if not image_url:
-            raise Exception(f"public_url is empty for photo {photo_id}")
-        img_resp = await client.get(image_url, timeout=30.0)
-        if img_resp.status_code != 200:
-            raise Exception(f"Cannot download {image_url} (status {img_resp.status_code})")
-        with open(save_path, "wb") as f:
-            f.write(img_resp.content)
+async def download_image(client: httpx.AsyncClient, photo_id: str, save_path: str):
+    db_url = f"{SUPABASE_URL}/rest/v1/colmap_photos?id=eq.{photo_id}&select=public_url"
+    db_resp = await client.get(db_url, headers=HEADERS_JSON, timeout=10.0)
+    
+    if db_resp.status_code != 200 or not db_resp.json():
+        raise Exception(f"Photo {photo_id} not found (status {db_resp.status_code})")
+        
+    image_url = db_resp.json()[0].get("public_url")
+    if not image_url:
+        raise Exception(f"public_url is empty for photo {photo_id}")
+        
+    img_resp = await client.get(image_url, timeout=30.0)
+    if img_resp.status_code != 200:
+        raise Exception(f"Cannot download {image_url} (status {img_resp.status_code})")
+        
+    with open(save_path, "wb") as f:
+        f.write(img_resp.content)
+    print(f"  -> {save_path} downloaded")
 
 
 # ---------------------------------------------------------------------------
@@ -91,9 +95,6 @@ async def upload_to_supabase_storage(analysis_id: str, file_path: str, filename:
 # ---------------------------------------------------------------------------
 
 async def save_results_to_db(analysis_id: str, ply_url: Optional[str], glb_url: Optional[str]):
-    """
-    Делает одну запись в таблицу dust3r_results, содержащую ссылки на оба файла.
-    """
     payload = {"analysis_id": analysis_id}
     if ply_url:
         payload["ply_url"] = ply_url
@@ -101,13 +102,13 @@ async def save_results_to_db(analysis_id: str, ply_url: Optional[str], glb_url: 
         payload["glb_url"] = glb_url
 
     try:
+        async with httpx.AsyncClient() as client:   # ← добавить эту строку
             db_resp = await client.post(
                 f"{SUPABASE_URL}/rest/v1/dust3r_results",
                 headers=HEADERS_JSON,
                 json=payload,
                 timeout=10.0,
             )
-
             if db_resp.status_code in (200, 201):
                 print(f"[DUSt3R] DB record saved for analysis {analysis_id}")
             else:
@@ -174,13 +175,18 @@ async def trigger_dust3r(request: Request):
         else:
             print(f"[DUSt3R] EXIF saved: {len(exif_raw)} entries, no focal/GPS metadata")
 
-    # --- Скачиваем фото ---
-    print("[DUSt3R] Downloading photos...")
+    # --- Скачиваем фото (ИСПРАВЛЕНО НА ПАРАЛЛЕЛЬНОЕ) ---
+    print("[DUSt3R] Downloading photos in parallel...")
     try:
-        for idx, photo_id in enumerate(photo_ids):
-            save_path = os.path.join(project_dir, f"{idx:03d}.jpg")
-            await download_image(photo_id, save_path)
-            print(f"  -> {save_path}")
+        async with httpx.AsyncClient() as client:
+            tasks = []
+            for idx, photo_id in enumerate(photo_ids):
+                save_path = os.path.join(project_dir, f"{idx:03d}.jpg")
+                # Создаем задачу на скачивание, но не ждем её выполнения сразу
+                tasks.append(download_image(client, photo_id, save_path))
+            
+            # Запускаем все задачи одновременно
+            await asyncio.gather(*tasks)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Photo download error: {e}")
 
