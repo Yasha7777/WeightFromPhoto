@@ -19,7 +19,6 @@ HEADERS_JSON = {
     "Accept":        "application/json",
 }
 
-# Название бакета в Supabase Storage
 PLY_BUCKET = "dust3r-ply"
 
 
@@ -30,31 +29,29 @@ PLY_BUCKET = "dust3r-ply"
 async def download_image(client: httpx.AsyncClient, photo_id: str, save_path: str):
     db_url = f"{SUPABASE_URL}/rest/v1/colmap_photos?id=eq.{photo_id}&select=public_url"
     db_resp = await client.get(db_url, headers=HEADERS_JSON, timeout=10.0)
-    
+
     if db_resp.status_code != 200 or not db_resp.json():
         raise Exception(f"Photo {photo_id} not found (status {db_resp.status_code})")
-        
+
     image_url = db_resp.json()[0].get("public_url")
     if not image_url:
         raise Exception(f"public_url is empty for photo {photo_id}")
-        
+
     img_resp = await client.get(image_url, timeout=30.0)
     if img_resp.status_code != 200:
         raise Exception(f"Cannot download {image_url} (status {img_resp.status_code})")
-        
+
     with open(save_path, "wb") as f:
         f.write(img_resp.content)
     print(f"  -> {save_path} downloaded")
 
 
 # ---------------------------------------------------------------------------
-# ИЗМЕНЕНО: Универсальная функция загрузки файлов в Supabase Storage
+# Загрузка файла в Supabase Storage
 # ---------------------------------------------------------------------------
 
-async def upload_to_supabase_storage(analysis_id: str, file_path: str, filename: str, content_type: str) -> Optional[str]:
-    """
-    Загружает указанный файл в бакет dust3r-ply и возвращает публичную ссылку.
-    """
+async def upload_to_supabase_storage(analysis_id: str, file_path: str,
+                                      filename: str, content_type: str) -> Optional[str]:
     storage_path = f"{analysis_id}/{filename}"
     upload_url   = f"{SUPABASE_URL}/storage/v1/object/{PLY_BUCKET}/{storage_path}"
     public_url   = f"{SUPABASE_URL}/storage/v1/object/public/{PLY_BUCKET}/{storage_path}"
@@ -63,23 +60,24 @@ async def upload_to_supabase_storage(analysis_id: str, file_path: str, filename:
         with open(file_path, "rb") as f:
             file_bytes = f.read()
 
-        print(f"[DUSt3R] Uploading {filename} to Supabase Storage ({len(file_bytes)//1024} KB)...")
+        print(f"[DUSt3R] Uploading {filename} ({len(file_bytes)//1024} KB)...")
 
         async with httpx.AsyncClient() as client:
             upload_resp = await client.post(
                 upload_url,
                 content=file_bytes,
                 headers={
-                    "apikey":          SUPABASE_KEY,
-                    "Authorization":   f"Bearer {SUPABASE_KEY}",
-                    "Content-Type":    content_type,
-                    "x-upsert":        "true",
+                    "apikey":        SUPABASE_KEY,
+                    "Authorization": f"Bearer {SUPABASE_KEY}",
+                    "Content-Type":  content_type,
+                    "x-upsert":      "true",
                 },
                 timeout=120.0,
             )
 
             if upload_resp.status_code not in (200, 201):
-                print(f"[DUSt3R] {filename} upload failed: {upload_resp.status_code} {upload_resp.text}")
+                print(f"[DUSt3R] {filename} upload failed: "
+                      f"{upload_resp.status_code} {upload_resp.text}")
                 return None
 
             print(f"[DUSt3R] {filename} uploaded -> {public_url}")
@@ -91,18 +89,30 @@ async def upload_to_supabase_storage(analysis_id: str, file_path: str, filename:
 
 
 # ---------------------------------------------------------------------------
-# ДОБАВЛЕНО: Функция записи ссылок результатов в базу данных
+# Запись результатов в БД
 # ---------------------------------------------------------------------------
 
-async def save_results_to_db(analysis_id: str, ply_url: Optional[str], glb_url: Optional[str]):
+async def save_results_to_db(analysis_id: str, ply_url: Optional[str],
+                              glb_url: Optional[str], gpu_result: dict):
+    """
+    Сохраняет ссылки на файлы и метрики в таблицу dust3r_results.
+    """
     payload = {"analysis_id": analysis_id}
     if ply_url:
         payload["ply_url"] = ply_url
     if glb_url:
         payload["glb_url"] = glb_url
 
+    # Метрики объёма и масштаба
+    for key in ("scale_cube", "scale_weighted", "scale_median", "scale_source",
+                "volume_dust3r_units", "volume_m3", "volume_m3_weighted", "volume_m3_median",
+                "point_count"):
+        val = gpu_result.get(key)
+        if val is not None:
+            payload[key] = val
+
     try:
-        async with httpx.AsyncClient() as client:   # ← добавить эту строку
+        async with httpx.AsyncClient() as client:
             db_resp = await client.post(
                 f"{SUPABASE_URL}/rest/v1/dust3r_results",
                 headers=HEADERS_JSON,
@@ -161,31 +171,28 @@ async def trigger_dust3r(request: Request):
         exif_json_path = os.path.join(project_dir, "exif.json")
         with open(exif_json_path, "w") as f:
             json.dump(exif_raw, f)
-    
+
         first_entry = exif_raw[0] if exif_raw else None
         first = None
         if isinstance(first_entry, dict):
             first = first_entry.get("exif") or first_entry
             if not isinstance(first, dict):
                 first = None
-    
+
         if first:
             print(f"[DUSt3R] EXIF saved: focal_real={first.get('focal_real')}mm "
                   f"orig={first.get('orig_width')}x{first.get('orig_height')}")
         else:
             print(f"[DUSt3R] EXIF saved: {len(exif_raw)} entries, no focal/GPS metadata")
 
-    # --- Скачиваем фото (ИСПРАВЛЕНО НА ПАРАЛЛЕЛЬНОЕ) ---
+    # --- Скачиваем фото параллельно ---
     print("[DUSt3R] Downloading photos in parallel...")
     try:
         async with httpx.AsyncClient() as client:
-            tasks = []
-            for idx, photo_id in enumerate(photo_ids):
-                save_path = os.path.join(project_dir, f"{idx:03d}.jpg")
-                # Создаем задачу на скачивание, но не ждем её выполнения сразу
-                tasks.append(download_image(client, photo_id, save_path))
-            
-            # Запускаем все задачи одновременно
+            tasks = [
+                download_image(client, photo_id, os.path.join(project_dir, f"{idx:03d}.jpg"))
+                for idx, photo_id in enumerate(photo_ids)
+            ]
             await asyncio.gather(*tasks)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Photo download error: {e}")
@@ -205,14 +212,14 @@ async def trigger_dust3r(request: Request):
         with open(result_json_path) as f:
             gpu_result = json.load(f)
 
-    # --- ИЗМЕНЕНО: Загружаем файлы в Supabase Storage ---
+    # --- Загружаем PLY в Supabase Storage ---
     ply_url = None
     if os.path.exists(output_ply):
         ply_url = await upload_to_supabase_storage(
             analysis_id, output_ply, "dust3r_output.ply", "application/octet-stream"
         )
 
-    # ДОБАВЛЕНО: Загрузка GLB меша
+    # --- Загружаем GLB в Supabase Storage ---
     output_glb = output_ply.replace(".ply", ".glb")
     glb_url = None
     if os.path.exists(output_glb):
@@ -220,36 +227,44 @@ async def trigger_dust3r(request: Request):
             analysis_id, output_glb, "dust3r_output.glb", "model/gltf-binary"
         )
 
-    # ДОБАВЛЕНО: Сохраняем ссылки в БД одной транзакцией
+    # --- Сохраняем в БД ---
     if ply_url or glb_url:
-        await save_results_to_db(analysis_id, ply_url, glb_url)
+        await save_results_to_db(analysis_id, ply_url, glb_url, gpu_result)
 
-    # --- Формируем ответ для n8n ---
+    # --- Ответ для n8n ---
     result = {
         "status":              "success",
         "analysis_id":         analysis_id,
         "point_count":         gpu_result.get("point_count"),
+
+        # Масштабы
+        "scale_cube":          gpu_result.get("scale_cube"),
+        "scale_source":        gpu_result.get("scale_source"),
         "scale_weighted":      gpu_result.get("scale_weighted"),
         "scale_median":        gpu_result.get("scale_median"),
+
+        # Объёмы
         "volume_dust3r_units": gpu_result.get("volume_dust3r_units"),
+        "volume_m3":           gpu_result.get("volume_m3"),        # лучший scale (куб или GPS)
         "volume_m3_weighted":  gpu_result.get("volume_m3_weighted"),
         "volume_m3_median":    gpu_result.get("volume_m3_median"),
-        
-        # Ссылки на файлы для фронтенда
+
+        # Файлы
         "ply_url":             ply_url,
         "ply_file":            output_ply,
-        "glb_url":             glb_url,   # ДОБАВЛЕНО
-        "glb_file":            output_glb,  # ДОБАВЛЕНО
+        "glb_url":             glb_url,
+        "glb_file":            output_glb,
     }
 
-    v_w = result.get("volume_m3_weighted")
-    v_m = result.get("volume_m3_median")
-    if v_w is not None:
-        print(f"[DUSt3R] Volume weighted: {v_w} m3 | median: {v_m} m3")
+    # Лог
+    v   = result.get("volume_m3")
+    src = result.get("scale_source", "?")
+    if v is not None:
+        print(f"[DUSt3R] Volume ({src}): {v} m3")
     if ply_url:
         print(f"[DUSt3R] PLY URL: {ply_url}")
     if glb_url:
-        print(f"[DUSt3R] GLB URL: {glb_url}")  # ДОБАВЛЕНО
+        print(f"[DUSt3R] GLB URL: {glb_url}")
 
     return result
 
