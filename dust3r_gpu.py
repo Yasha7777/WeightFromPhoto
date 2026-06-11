@@ -148,8 +148,6 @@ def compute_scale_from_cube(img_files, pts3d_np, masks_np,
             else:
                 pts3d_corners.append(pts_map[iy, ix])
                 valid_flags.append(True)
-
-        valid_count = sum(valid_flags)
         
         cols = pattern[0]
         rows = pattern[1]
@@ -169,10 +167,19 @@ def compute_scale_from_cube(img_files, pts3d_np, masks_np,
                 if d_dust > 1e-6:
                     img_scales.append(square_size_m / d_dust)
 
+        # -- ФИЛЬТРАЦИЯ ВЫБРОСОВ В ПАРАХ КУБА --
         if img_scales:
-            img_scale = float(np.median(img_scales))
-            all_scales.append(img_scale)
-            print(f"[DUSt3R_GPU] Cube found on photo {img_idx}: scale={img_scale:.4f} m/unit")
+            img_scales_arr = np.array(img_scales)
+            img_median = float(np.median(img_scales_arr))
+            
+            # Отсекаем пары, которые сильно выбиваются из медианы (шум детекции)
+            valid_scales = img_scales_arr[(img_scales_arr >= 0.5 * img_median) & (img_scales_arr <= 2.0 * img_median)]
+            
+            if len(valid_scales) > 0:
+                img_scale = float(np.median(valid_scales))
+                all_scales.append(img_scale)
+                print(f"[DUSt3R_GPU] Cube found on photo {img_idx}: scale={img_scale:.4f} m/unit "
+                      f"(filtered {len(valid_scales)}/{len(img_scales)} valid pairs)")
 
     if not all_scales:
         print("[DUSt3R_GPU] Cube not found on any photo")
@@ -216,14 +223,10 @@ def focal_px_from_exif(exif_list, dust3r_img_size=512):
 
 
 # ---------------------------------------------------------------------------
-# Isolation: Очистка от земли и шума перед Пуассоном и Объемом
+# Isolation: Очистка от земли и шума
 # ---------------------------------------------------------------------------
 
 def isolate_pile(pts, colors):
-    """
-    Удаляет землю (RANSAC) и оставляет только самый крупный кластер (кучу).
-    Возвращает очищенные массивы точек и цветов.
-    """
     if not OPEN3D_AVAILABLE:
         return pts, colors
 
@@ -239,7 +242,7 @@ def isolate_pile(pts, colors):
     )
     pcd_no_ground = pcd.select_by_index(inliers, invert=True)
     
-    # 2. DBSCAN - Ищем главный кластер на downsampled версии для скорости
+    # 2. DBSCAN
     pcd_down = pcd_no_ground.voxel_down_sample(voxel_size=0.005)
     labels = np.array(pcd_down.cluster_dbscan(eps=0.05, min_points=100))
 
@@ -249,10 +252,10 @@ def isolate_pile(pts, colors):
 
     biggest = np.bincount(labels[labels >= 0]).argmax()
     
-    # 3. Вырезаем кластер из оригинального облака высокого разрешения по BBox
+    # 3. BBox
     cluster_down_pcd = pcd_down.select_by_index(np.where(labels == biggest)[0])
     bbox = cluster_down_pcd.get_axis_aligned_bounding_box()
-    bbox.scale(1.05, bbox.get_center()) # Берем с запасом 5%, чтобы не срезать края
+    bbox.scale(1.05, bbox.get_center()) 
     
     pile_pcd = pcd_no_ground.crop(bbox)
     print(f"[DUSt3R_GPU] Pile isolated: {len(pile_pcd.points)} points "
@@ -265,18 +268,44 @@ def isolate_pile(pts, colors):
 
 
 # ---------------------------------------------------------------------------
-# Volume (Теперь работает с УЖЕ очищенным облаком)
+# Volume: Пуассон с фоллбэком на ConvexHull
 # ---------------------------------------------------------------------------
 
-def compute_volume_convex_hull(pts):
+def compute_volume(pts):
     from scipy.spatial import ConvexHull
-    # Используем отзеркаливание относительно самой нижней точки кучи, 
-    # чтобы создать замкнутый объем для ConvexHull
+    
+    # Отзеркаливаем кучу вниз для создания замкнутого объема
     z_min = pts[:, 2].min()
     mirrored = pts.copy()
     mirrored[:, 2] = 2 * z_min - mirrored[:, 2]
-    hull = ConvexHull(np.vstack([pts, mirrored]))
-    return hull.volume / 2.0
+    full_pts = np.vstack([pts, mirrored])
+
+    # -- ПОПЫТКА ЧЕРЕЗ МЕШ ПУАССОНА --
+    if OPEN3D_AVAILABLE:
+        try:
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(full_pts)
+            
+            pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.05, max_nn=30))
+            pcd.orient_normals_consistent_tangent_plane(k=15)
+            
+            # Строим меш. Не обрезаем края по плотности, чтобы он остался watertight
+            mesh, _ = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=9)
+            
+            if mesh.is_watertight():
+                vol = mesh.get_volume() / 2.0  # Делим пополам из-за отзеркаливания
+                print(f"[DUSt3R_GPU] Volume calculated using Poisson Mesh: {vol:.6f} units")
+                return vol
+            else:
+                print("[DUSt3R_GPU] Poisson mesh is not watertight. Falling back to ConvexHull.")
+        except Exception as e:
+            print(f"[DUSt3R_GPU] Poisson volume error: {e}. Falling back to ConvexHull.")
+
+    # -- РЕЗЕРВНЫЙ ВАРИАНТ ЧЕРЕЗ CONVEX HULL --
+    hull = ConvexHull(full_pts)
+    vol = hull.volume / 2.0
+    print(f"[DUSt3R_GPU] Volume calculated using ConvexHull: {vol:.6f} units")
+    return vol
 
 
 # ---------------------------------------------------------------------------
@@ -296,46 +325,39 @@ def save_ply(filepath, pts, colors):
 
 
 # ---------------------------------------------------------------------------
-# GLB mesh (Теперь работает ИДЕАЛЬНО благодаря чистому облаку)
+# GLB mesh (Визуальный меш для вывода)
 # ---------------------------------------------------------------------------
 
 def pointcloud_to_mesh(pts, colors, output_glb_path):
     if not OPEN3D_AVAILABLE:
         return None
 
-    print(f"[DUSt3R_GPU] Creating mesh from {len(pts)} points using Poisson...")
+    print(f"[DUSt3R_GPU] Creating visual mesh from {len(pts)} points using Poisson...")
 
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(pts)
     pcd.colors = o3d.utility.Vector3dVector(colors / 255.0)
 
-    # 1. Outlier removal
     cl, ind = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
     pcd = pcd.select_by_index(ind)
 
-    # 2. Адаптивный downsampling
     bbox = np.asarray(pcd.get_max_bound()) - np.asarray(pcd.get_min_bound())
     voxel_size = float(np.min(bbox)) * 0.005 
     voxel_size = max(0.001, min(voxel_size, 0.02)) 
     pcd = pcd.voxel_down_sample(voxel_size=voxel_size)
 
-    # 3. Нормали
     normal_radius = voxel_size * 10
     pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(
         radius=normal_radius, max_nn=30))
     pcd.orient_normals_consistent_tangent_plane(k=15)
 
-    # 4. Пуассон depth=10
-    print("[DUSt3R_GPU] Running Poisson reconstruction...")
     mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=10)
 
-    # 5. Удаление артефактов (плотность < 15%)
+    # Удаляем артефакты (визуальный меш перестает быть watertight, но выглядит красиво)
     densities = np.asarray(densities)
     vertices_to_remove = densities < np.quantile(densities, 0.15)
     mesh.remove_vertices_by_mask(vertices_to_remove)
 
-    # 6. Перенос цвета
-    print("[DUSt3R_GPU] Transferring colors...")
     kdtree = o3d.geometry.KDTreeFlann(pcd)
     mesh_colors = []
     for v in np.asarray(mesh.vertices):
@@ -343,17 +365,14 @@ def pointcloud_to_mesh(pts, colors, output_glb_path):
         mesh_colors.append(np.asarray(pcd.colors)[idx[0]])
     mesh.vertex_colors = o3d.utility.Vector3dVector(np.vstack(mesh_colors))
 
-    # 7. Фикс перевёрнутости
     R = mesh.get_rotation_matrix_from_xyz((np.pi, 0, 0))
     mesh.rotate(R, center=mesh.get_center())
 
-    # 8. Гамма-коррекция
     mesh_colors_np = np.power(np.asarray(mesh.vertex_colors), 1.5)
     mesh.vertex_colors = o3d.utility.Vector3dVector(mesh_colors_np)
 
-    # 9. Сохраняем GLB
     o3d.io.write_triangle_mesh(output_glb_path, mesh, write_ascii=False, compressed=True)
-    print(f"[DUSt3R_GPU] Mesh saved to {output_glb_path} ({len(mesh.triangles)} faces)")
+    print(f"[DUSt3R_GPU] Visual mesh saved to {output_glb_path} ({len(mesh.triangles)} faces)")
     return output_glb_path
 
 # ---------------------------------------------------------------------------
@@ -431,7 +450,6 @@ def main():
     final_colors = np.concatenate(all_colors, axis=0)
 
     # -- ПОИСК МАСШТАБА --
-    # Важно: масштаб ищем ДО изоляции, так как куб может лежать на земле
     scale_cube = compute_scale_from_cube(
         img_files, pts3d_np, masks_np,
         square_size_m=args.cube_square_m, pattern=(3, 3), dust3r_size=512
@@ -443,10 +461,16 @@ def main():
         cam_centers = poses[:, :3, 3]
         scale_weighted, scale_median = compute_scale_from_gps(gps_coords, cam_centers)
 
+    # Игнорируем GPS, если куб успешно найден (чтобы избежать огромной погрешности)
+    if scale_cube is not None:
+        print("[DUSt3R_GPU] Accurate cube scale found. Discarding GPS scales to prevent discrepancy.")
+        scale_weighted = None
+        scale_median   = None
+
     best_scale = scale_cube if scale_cube is not None else scale_weighted
     scale_source = "cube" if scale_cube is not None else ("gps_weighted" if scale_weighted else None)
 
-    # -- ИЗОЛЯЦИЯ КУЧИ (НОВЫЙ ШАГ) --
+    # -- ИЗОЛЯЦИЯ КУЧИ --
     print("[DUSt3R_GPU] Isolating target material from scene...")
     clean_pts, clean_colors = isolate_pile(final_pts, final_colors)
     if len(clean_pts) > 100:
@@ -459,9 +483,8 @@ def main():
     volume_m3_med = None
 
     try:
-        # Передаем уже очищенное облако
-        volume_units = compute_volume_convex_hull(final_pts)
-        print(f"[DUSt3R_GPU] Volume (DUSt3R units): {volume_units:.6f}")
+        # Теперь считаем объем по обновленной логике (Mesh Poisson / ConvexHull)
+        volume_units = compute_volume(final_pts)
 
         if best_scale is not None:
             volume_m3 = volume_units * (best_scale ** 3)
@@ -491,7 +514,6 @@ def main():
     if not args.no_glb and OPEN3D_AVAILABLE and len(final_pts) > 1000:
         try:
             glb_file_path = args.output.replace(".ply", ".glb")
-            # Пуассон теперь натягивается ТОЛЬКО на чистую кучу
             pointcloud_to_mesh(final_pts, final_colors, glb_file_path)
             with open(glb_file_path, "rb") as f:
                 glb_base64 = base64.b64encode(f.read()).decode("utf-8")
