@@ -253,12 +253,44 @@ def focal_px_from_exif(exif_list, dust3r_img_size=512):
 # Volume
 # ---------------------------------------------------------------------------
 
-def compute_volume_convex_hull(pts):
+def compute_volume_pile_only(pts):
+    import open3d as o3d
+    import numpy as np
     from scipy.spatial import ConvexHull
-    z_min    = pts[:, 2].min()
-    mirrored = pts.copy()
+
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(pts)
+
+    # 1. Убираем плоскость земли через RANSAC
+    plane_model, inliers = pcd.segment_plane(
+        distance_threshold=0.02,  # 2 см — точки в пределах плоскости
+        ransac_n=3,
+        num_iterations=1000
+    )
+    pcd_no_ground = pcd.select_by_index(inliers, invert=True)
+    print(f"[Volume] After ground removal: {len(pcd_no_ground.points)} points")
+
+    # 2. DBSCAN — кластеризуем что осталось
+    labels = np.array(pcd_no_ground.cluster_dbscan(
+        eps=0.05,       # 5 см — расстояние между точками одного кластера
+        min_points=100
+    ))
+
+    if labels.max() < 0:
+        print("[Volume] No clusters found after ground removal")
+        return None
+
+    # 3. Берём самый большой кластер — это и есть куча
+    biggest = np.bincount(labels[labels >= 0]).argmax()
+    pile_pts = np.asarray(pcd_no_ground.points)[labels == biggest]
+    print(f"[Volume] Pile cluster: {len(pile_pts)} points "
+          f"({len(pile_pts)/len(pts)*100:.1f}% of total)")
+
+    # 4. ConvexHull только по куче
+    z_min = pile_pts[:, 2].min()
+    mirrored = pile_pts.copy()
     mirrored[:, 2] = 2 * z_min - mirrored[:, 2]
-    hull = ConvexHull(np.vstack([pts, mirrored]))
+    hull = ConvexHull(np.vstack([pile_pts, mirrored]))
     return hull.volume / 2.0
 
 
@@ -476,7 +508,7 @@ def main():
     volume_m3_med = None
 
     try:
-        volume_units = compute_volume_convex_hull(final_pts)
+        volume_units = compute_volume_pile_only(final_pts)
         print(f"[DUSt3R_GPU] Volume (DUSt3R units): {volume_units:.6f}")
 
         if best_scale is not None:
