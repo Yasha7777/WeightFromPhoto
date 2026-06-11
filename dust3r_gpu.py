@@ -151,13 +151,29 @@ def compute_scale_from_cube(img_files, pts3d_np, masks_np,
         for (px, py) in corners_flat:
             ix = int(np.clip(px * scale_x, 0, dust3r_w - 1))
             iy = int(np.clip(py * scale_y, 0, dust3r_h - 1))
-            if mask_map[iy, ix]:
-                pts3d_corners.append(pts_map[iy, ix])
+            # Ищем лучшую точку в окрестности 5x5 пикселей DUSt3R
+            patch_r = 2
+            best_pt = None
+            for dy in range(-patch_r, patch_r + 1):
+                for dx in range(-patch_r, patch_r + 1):
+                    ny = int(np.clip(iy + dy, 0, dust3r_h - 1))
+                    nx = int(np.clip(ix + dx, 0, dust3r_w - 1))
+                    if mask_map[ny, nx]:
+                        best_pt = pts_map[ny, nx]
+                        break
+                if best_pt is not None:
+                    break
+
+            if best_pt is not None:
+                pts3d_corners.append(best_pt)
                 valid_flags.append(True)
             else:
-                pts3d_corners.append(None)
-                valid_flags.append(False)
+                # Маска нет нигде рядом — берём без маски (угол найден SubPix'ом точно)
+                pts3d_corners.append(pts_map[iy, ix])
+                valid_flags.append(True)  # ← доверяем SubPix, а не маске
 
+        valid_count = sum(valid_flags)
+        print(f"[DUSt3R_GPU] Photo {img_idx}: {valid_count}/9 corners have 3D points")
         # Соседние углы в паттерне (3x3 = 9 точек, строки по pattern[0])
         # Горизонтальные пары: (0,1),(1,2),(3,4),(4,5),(6,7),(7,8) — расстояние = square_size_m
         # Вертикальные пары:   (0,3),(1,4),(2,5),(3,6),(4,7),(5,8) — расстояние = square_size_m
@@ -177,6 +193,8 @@ def compute_scale_from_cube(img_files, pts3d_np, masks_np,
             if valid_flags[i] and valid_flags[j]:
                 d_dust = np.linalg.norm(pts3d_corners[i] - pts3d_corners[j])
                 if d_dust > 1e-6:
+                    scale_candidate = square_size_m / d_dust
+                    print(f"  pair ({i},{j}): d_dust={d_dust:.6f}  scale={scale_candidate:.4f}")
                     img_scales.append(square_size_m / d_dust)
 
         if img_scales:
