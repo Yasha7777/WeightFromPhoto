@@ -269,6 +269,7 @@ def compute_volume_pile_only(pts):
     )
     pcd_no_ground = pcd.select_by_index(inliers, invert=True)
     print(f"[Volume] After ground removal: {len(pcd_no_ground.points)} points")
+    pcd_no_ground = pcd_no_ground.voxel_down_sample(voxel_size=0.005)
 
     # 2. DBSCAN — кластеризуем что осталось
     labels = np.array(pcd_no_ground.cluster_dbscan(
