@@ -280,22 +280,29 @@ def pointcloud_to_mesh(pts, colors, output_glb_path):
     pcd = pcd.select_by_index(ind)
     print(f"[DUSt3R_GPU] After outlier removal: {len(pcd.points)} points")
 
-    # 2. Downsampling (ускоряет Пуассон в 10-20 раз, без потери качества)
-    pcd = pcd.voxel_down_sample(voxel_size=0.05)
+    # 2. Адаптивный downsampling (зависит от реального размера облака)
+    bbox = np.asarray(pcd.get_max_bound()) - np.asarray(pcd.get_min_bound())
+    voxel_size = float(np.min(bbox)) * 0.005  # 0.5% от минимального измерения
+    voxel_size = max(0.001, min(voxel_size, 0.02))  # зажимаем: не меньше 1мм, не больше 2см
+    print(f"[DUSt3R_GPU] Voxel size: {voxel_size:.4f} (bbox min={np.min(bbox):.3f})")
+    pcd = pcd.voxel_down_sample(voxel_size=voxel_size)
     print(f"[DUSt3R_GPU] After downsampling: {len(pcd.points)} points")
 
-    # 3. Нормали
-    pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30))
+    # 3. Нормали — radius тоже адаптивный
+    normal_radius = voxel_size * 10
+    pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(
+        radius=normal_radius, max_nn=30))
     pcd.orient_normals_consistent_tangent_plane(k=15)
 
-    # 4. Пуассон
+    # 4. Пуассон depth=10 (больше детализации чем 9)
     print("[DUSt3R_GPU] Running Poisson reconstruction...")
-    mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=9)
+    mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=10)
 
-    # 5. Удаление артефактов
+    # 5. Удаление артефактов — порог 0.15 убирает больше мусора фона
     densities = np.asarray(densities)
-    vertices_to_remove = densities < np.quantile(densities, 0.05)
+    vertices_to_remove = densities < np.quantile(densities, 0.15)
     mesh.remove_vertices_by_mask(vertices_to_remove)
+    print(f"[DUSt3R_GPU] After density filter: {len(mesh.vertices)} vertices")
 
     # 6. Перенос цвета
     print("[DUSt3R_GPU] Transferring colors...")
@@ -318,7 +325,6 @@ def pointcloud_to_mesh(pts, colors, output_glb_path):
     o3d.io.write_triangle_mesh(output_glb_path, mesh, write_ascii=False, compressed=True)
     print(f"[DUSt3R_GPU] Mesh saved to {output_glb_path} ({len(mesh.triangles)} faces)")
     return output_glb_path
-
 
 # ---------------------------------------------------------------------------
 # Main
