@@ -81,11 +81,11 @@ def compute_scale_from_gps(gps_coords, cam_centers):
 
 
 # ---------------------------------------------------------------------------
-# Cube scale
+# Cube scale (Новый размер стороны клетки: 7.1см / 4 = 1.775см = 0.01775м)
 # ---------------------------------------------------------------------------
 
 def compute_scale_from_cube(img_files, pts3d_np, masks_np,
-                             square_size_m=0.02,
+                             square_size_m=0.01775,
                              pattern=(3, 3),
                              dust3r_size=512):
     if not CV2_AVAILABLE:
@@ -385,7 +385,8 @@ def main():
     parser.add_argument("--output",     required=True)
     parser.add_argument("--exif_json",  default=None)
     parser.add_argument("--no_glb",     action="store_true")
-    parser.add_argument("--cube_square_m", type=float, default=0.02)
+    # ТУТ ИЗМЕНЕНО: дефолтный размер стороны одного квадрата теперь 0.01775м (7.1см / 4)
+    parser.add_argument("--cube_square_m", type=float, default=0.01775)
     args = parser.parse_args()
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
