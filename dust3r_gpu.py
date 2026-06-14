@@ -28,71 +28,26 @@ except ImportError:
     print("[DUSt3R_GPU] Warning: opencv not installed, cube scale detection disabled")
 
 
-# ---------------------------------------------------------------------------
-# GPS scale
-# ---------------------------------------------------------------------------
-
-def haversine_distance_m(lat1, lon1, lat2, lon2):
-    R = 6_371_000.0
-    dlat = radians(lat2 - lat1)
-    dlon = radians(lon2 - lon1) * cos(radians((lat1 + lat2) / 2))
-    return R * sqrt(dlat ** 2 + dlon ** 2)
-
-def compute_scale_from_gps(gps_coords, cam_centers):
-    """Returns (scale_weighted, scale_median) in m/unit."""
-    N = len(gps_coords)
-    if N < 2:
-        return None, None
-
-    pairs = []
-    for i in range(N):
-        for j in range(i + 1, N):
-            d_gps  = haversine_distance_m(*gps_coords[i], *gps_coords[j])
-            d_dust = np.linalg.norm(cam_centers[i] - cam_centers[j])
-            if d_dust > 1e-6:
-                pairs.append((d_gps, d_dust, d_gps / d_dust))
-
-    if not pairs:
-        return None, None
-
-    all_r        = [r for _, _, r in pairs]
-    scale_median = float(np.median(all_r))
-
-    pairs.sort(key=lambda x: x[0], reverse=True)
-    n_top    = max(3, len(pairs) * 30 // 100)
-    top      = pairs[:n_top]
-    GPS_MIN  = 7.0
-    reliable = [(g, d, r) for g, d, r in top if g >= GPS_MIN]
-    if not reliable:
-        reliable = top
-        print("[DUSt3R_GPU] Warning: all GPS pairs < 7m, scale accuracy is very low")
-
-    weights        = np.array([g for g, _, _ in reliable])
-    ratios         = np.array([r for _, _, r in reliable])
-    scale_weighted = float(np.average(ratios, weights=weights))
-
-    print(f"[DUSt3R_GPU] Scale weighted : {scale_weighted:.4f} m/unit "
-          f"({len(reliable)}/{len(pairs)} pairs, "
-          f"GPS {min(g for g,_,_ in reliable):.1f}..{max(g for g,_,_ in reliable):.1f}m)")
-    print(f"[DUSt3R_GPU] Scale median   : {scale_median:.4f} m/unit "
-          f"(all {len(all_r)} pairs, min={min(all_r):.3f} max={max(all_r):.3f})")
-
-    return scale_weighted, scale_median
-
 
 # ---------------------------------------------------------------------------
-# Cube scale (Новый размер стороны клетки: 7.1см / 4 = 1.775см = 0.01775м)
+# Cube scale
 # ---------------------------------------------------------------------------
 
 def compute_scale_from_cube(img_files, pts3d_np, masks_np,
                              square_size_m=0.01775,
                              pattern=(3, 3),
                              dust3r_size=512):
+    """
+    Ищет шахматный паттерн куба на фото, вычисляет масштаб сцены.
+    Возвращает (scale_cube, cube_3d_centers) где cube_3d_centers — список
+    3D-центров найденного куба (для последующего исключения из облака точек).
+    """
     if not CV2_AVAILABLE:
         print("[DUSt3R_GPU] OpenCV not available, skipping cube scale")
-        return None
+        return None, []
 
     all_scales = []
+    cube_3d_centers = []  # 3D-центры куба на каждом фото где он найден
 
     for img_idx, img_path in enumerate(img_files):
         img = cv2.imread(img_path)
@@ -101,13 +56,37 @@ def compute_scale_from_cube(img_files, pts3d_np, masks_np,
         orig_h, orig_w = img.shape[:2]
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-        ret, corners = cv2.findChessboardCorners(gray, pattern, None)
+        def find_chess_in_crops(gray_img, pat):
+            h, w = gray_img.shape
+            crops = [
+                (gray_img,                     0,    0   ),
+                (gray_img[:h//2, :w//2],       0,    0   ),
+                (gray_img[:h//2, w//2:],       0,    w//2),
+                (gray_img[h//2:, :w//2],       h//2, 0   ),
+                (gray_img[h//2:, w//2:],       h//2, w//2),
+                (gray_img[:h//2, w//4:3*w//4], 0,    w//4),
+                (gray_img[h//2:, w//4:3*w//4], h//2, w//4),
+            ]
+            flags = (cv2.CALIB_CB_ADAPTIVE_THRESH +
+                     cv2.CALIB_CB_NORMALIZE_IMAGE +
+                     cv2.CALIB_CB_FAST_CHECK)
+            for crop, oy, ox in crops:
+                r, c = cv2.findChessboardCorners(crop, pat, flags)
+                if r:
+                    c[:, 0, 0] += ox
+                    c[:, 0, 1] += oy
+                    print(f"[DUSt3R_GPU] Cube: pattern found in crop offset ({ox},{oy})")
+                    return True, c
+            return False, None
+
+        ret, corners = find_chess_in_crops(gray, pattern)
         if not ret:
             small = cv2.resize(gray, (orig_w // 2, orig_h // 2))
-            ret, corners_small = cv2.findChessboardCorners(small, pattern, None)
+            ret, corners_small = find_chess_in_crops(small, pattern)
             if ret:
                 corners = corners_small * 2.0
             else:
+                print(f"[DUSt3R_GPU] Cube: no pattern on photo {img_idx}")
                 continue
 
         if ret:
@@ -141,14 +120,19 @@ def compute_scale_from_cube(img_files, pts3d_np, masks_np,
                         break
                 if best_pt is not None:
                     break
-
             if best_pt is not None:
                 pts3d_corners.append(best_pt)
                 valid_flags.append(True)
             else:
                 pts3d_corners.append(pts_map[iy, ix])
                 valid_flags.append(True)
-        
+
+        # Сохраняем 3D-центр куба для этого фото
+        valid_pts = [pts3d_corners[i] for i in range(len(pts3d_corners)) if valid_flags[i]]
+        if valid_pts:
+            cube_center_3d = np.mean(valid_pts, axis=0)
+            cube_3d_centers.append(cube_center_3d)
+
         cols = pattern[0]
         rows = pattern[1]
         neighbor_pairs = []
@@ -167,27 +151,39 @@ def compute_scale_from_cube(img_files, pts3d_np, masks_np,
                 if d_dust > 1e-6:
                     img_scales.append(square_size_m / d_dust)
 
-        # -- ФИЛЬТРАЦИЯ ВЫБРОСОВ В ПАРАХ КУБА --
         if img_scales:
             img_scales_arr = np.array(img_scales)
             img_median = float(np.median(img_scales_arr))
-            
-            # Отсекаем пары, которые сильно выбиваются из медианы (шум детекции)
-            valid_scales = img_scales_arr[(img_scales_arr >= 0.5 * img_median) & (img_scales_arr <= 2.0 * img_median)]
-            
+            valid_scales = img_scales_arr[
+                (img_scales_arr >= 0.5 * img_median) &
+                (img_scales_arr <= 2.0 * img_median)
+            ]
             if len(valid_scales) > 0:
                 img_scale = float(np.median(valid_scales))
+
+                # --- SANITY CHECK ---
+                # Съёмка объекта с расстояния ~30см–2м.
+                # Если scale выходит за эти пределы — куб найден ошибочно
+                # (например, шахматный паттерн на фоне или артефакт DUSt3R).
+                SCALE_MIN = 0.001  # Расширяем лимит
+                SCALE_MAX = 20.0   # Расширяем лимит
+                if not (SCALE_MIN <= img_scale <= SCALE_MAX):
+                    print(f"[DUSt3R_GPU] Cube photo {img_idx}: scale={img_scale:.4f} REJECTED "
+                          f"(out of plausible range {SCALE_MIN}–{SCALE_MAX} m/unit). "
+                          f"Likely false detection or DUSt3R scale degenerate.")
+                    continue
+
                 all_scales.append(img_scale)
                 print(f"[DUSt3R_GPU] Cube found on photo {img_idx}: scale={img_scale:.4f} m/unit "
                       f"(filtered {len(valid_scales)}/{len(img_scales)} valid pairs)")
 
     if not all_scales:
         print("[DUSt3R_GPU] Cube not found on any photo")
-        return None
+        return None, []
 
     scale_cube = float(np.median(all_scales))
     print(f"[DUSt3R_GPU] Cube scale FINAL: {scale_cube:.4f} m/unit")
-    return scale_cube
+    return scale_cube, cube_3d_centers
 
 
 # ---------------------------------------------------------------------------
@@ -223,77 +219,316 @@ def focal_px_from_exif(exif_list, dust3r_img_size=512):
 
 
 # ---------------------------------------------------------------------------
-# Isolation: Очистка от земли и шума
+# Isolation: отделяем целевой объект, явно исключая куб
 # ---------------------------------------------------------------------------
 
-def isolate_pile(pts, colors):
+def isolate_target_object(pts, colors, scale_m_per_unit=None, cube_3d_centers=None):
+    """
+    Изолирует ЦЕЛЕВОЙ объект (кучу / банку) из облака точек.
+
+    Логика:
+    1. RANSAC убирает пол
+    2. DBSCAN даёт кластеры
+    3. Если известны 3D-центры куба → исключаем кластеры близкие к кубу
+    4. Из оставшихся берём САМЫЙ БОЛЬШОЙ кластер (это и есть целевой объект)
+    5. BBox вокруг него с небольшим запасом
+
+    Параметры:
+        cube_3d_centers: список np.array[3] — центры куба в 3D (из compute_scale_from_cube)
+    """
     if not OPEN3D_AVAILABLE:
-        return pts, colors
+        return pts, colors, None
 
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(pts)
     pcd.colors = o3d.utility.Vector3dVector(colors / 255.0)
 
-    # 1. RANSAC - Убираем землю
+    # --- Параметры в единицах сцены ---
+    # Sanity check: scale должен быть в разумном диапазоне.
+    # Если нет — используем фиксированные эвристические параметры
+    # (они работают хорошо при типичных DUSt3R-сценах съёмки вблизи).
+    SCALE_REASONABLE_MIN = 0.001 # Расширяем лимит
+    SCALE_REASONABLE_MAX = 20.0  # Расширяем лимит
+    scale_ok = (scale_m_per_unit is not None and
+                SCALE_REASONABLE_MIN <= scale_m_per_unit <= SCALE_REASONABLE_MAX)
+
+    if scale_ok:
+        ransac_dist           = 0.03  / scale_m_per_unit  # 3 см
+        voxel_units           = 0.005 / scale_m_per_unit  # 5 мм
+        eps_units             = 0.025 / scale_m_per_unit  # 2.5 см
+        cube_exclusion_radius = 0.10  / scale_m_per_unit  # 10 см вокруг куба
+        print(f"[DUSt3R_GPU] isolate_target: scale={scale_m_per_unit:.4f} "
+              f"=> eps={eps_units:.5f} voxel={voxel_units:.5f} ransac={ransac_dist:.5f} "
+              f"cube_excl_r={cube_exclusion_radius:.5f}")
+    else:
+        # Фиксированные параметры — хорошо работают для сцен ~0.3–1.5м
+        ransac_dist           = 0.02
+        voxel_units           = 0.005
+        eps_units             = 0.05
+        cube_exclusion_radius = 0.15
+        if scale_m_per_unit is not None:
+            print(f"[DUSt3R_GPU] isolate_target: scale={scale_m_per_unit:.4f} is UNREALISTIC, "
+                  f"using fixed params (eps={eps_units}, voxel={voxel_units}, ransac={ransac_dist})")
+        else:
+            print(f"[DUSt3R_GPU] isolate_target: no scale, "
+                  f"using fixed params (eps={eps_units}, voxel={voxel_units}, ransac={ransac_dist})")
+
+    # 1. Убираем пол (RANSAC) + отрезаем "подземные" артефакты и траву
     plane_model, inliers = pcd.segment_plane(
-        distance_threshold=0.02,
+        distance_threshold=ransac_dist,
         ransac_n=3,
         num_iterations=1000
     )
-    pcd_no_ground = pcd.select_by_index(inliers, invert=True)
     
-    # 2. DBSCAN
-    pcd_down = pcd_no_ground.voxel_down_sample(voxel_size=0.005)
-    labels = np.array(pcd_down.cluster_dbscan(eps=0.05, min_points=100))
+    [a, b, c, d] = plane_model
+    all_pts = np.asarray(pcd.points)
+    signed_dist = all_pts.dot([a, b, c]) + d
+    
+    # Убеждаемся, что вектор нормали смотрит "вверх" (где находится большинство точек объекта)
+    outlier_mask = np.abs(signed_dist) > ransac_dist
+    if np.sum(outlier_mask) > 0:
+        far_side = signed_dist[outlier_mask]
+        # сторона объекта = знак самых удалённых точек (по медиане дальних)
+        if np.median(far_side[np.abs(far_side) > np.percentile(np.abs(far_side), 75)]) < 0:
+            signed_dist = -signed_dist
+            a, b, c, d = -a, -b, -c, -d
+    else:
+        # fallback на старую логику
+        if np.sum(signed_dist > 0) < np.sum(signed_dist < 0):
+            signed_dist = -signed_dist
+            a, b, c, d = -a, -b, -c, -d
 
-    if labels.max() < 0:
-        print("[DUSt3R_GPU] Warning: No valid clusters found after ground removal.")
-        return pts, colors
+    plane_oriented = np.array([a, b, c, d])
+        
+    # Срезаем всё, что ниже асфальта (подземный шум) 
+    # И прихватываем небольшой слой сверху (ransac_dist * 1.5), чтобы "скосить" траву.
+    # Это оторвёт куб от полусферы.
+    grass_trim = ransac_dist * 1.5 
+    above_ground_idx = np.where(signed_dist > grass_trim)[0]
+    
+    pcd_no_ground = pcd.select_by_index(above_ground_idx)
+    print(f"[DUSt3R_GPU] After ground & grass removal: {len(pcd_no_ground.points)} points")
 
-    biggest = np.bincount(labels[labels >= 0]).argmax()
-    
-    # 3. BBox
-    cluster_down_pcd = pcd_down.select_by_index(np.where(labels == biggest)[0])
-    bbox = cluster_down_pcd.get_axis_aligned_bounding_box()
-    bbox.scale(1.05, bbox.get_center()) 
-    
+    # Защита: если RANSAC/флип убил всё облако — не падаем, отдаём исходное
+    if len(pcd_no_ground.points) < 100:
+        print("[DUSt3R_GPU] WARNING: ground removal left too few points. "
+              "Skipping isolation, returning all points.")
+        return pts, colors, None
+    print(f"[DUSt3R_GPU] After ground & grass removal: {len(pcd_no_ground.points)} points")
+
+    # 2. Даунсемплинг + DBSCAN
+    pcd_down = pcd_no_ground.voxel_down_sample(voxel_size=voxel_units)
+    labels   = np.array(pcd_down.cluster_dbscan(eps=eps_units, min_points=50))
+    pcd_down_pts = np.asarray(pcd_down.points)
+
+    n_clusters = labels.max() + 1
+    if n_clusters <= 0:
+        print("[DUSt3R_GPU] Warning: No clusters found after ground removal. Returning all points.")
+        return pts, colors, None
+
+    print(f"[DUSt3R_GPU] DBSCAN found {n_clusters} clusters (+ noise)")
+
+    # 3. Собираем информацию по каждому кластеру
+    cluster_info = {}
+    for label_id in range(n_clusters):
+        mask = labels == label_id
+        count = mask.sum()
+        if count < 50:
+            continue
+        cluster_pts    = pcd_down_pts[mask]
+        cluster_center = cluster_pts.mean(axis=0)
+
+        # Проверяем: является ли этот кластер кубом?
+        is_cube = False
+        if cube_3d_centers:
+            for cc in cube_3d_centers:
+                dist = np.linalg.norm(cluster_center - np.array(cc))
+                if dist < cube_exclusion_radius:
+                    is_cube = True
+                    break
+
+        cluster_info[label_id] = {
+            'count':   count,
+            'center':  cluster_center,
+            'is_cube': is_cube,
+        }
+        marker = " [CUBE - excluded]" if is_cube else ""
+        print(f"[DUSt3R_GPU]   Cluster #{label_id}: {count} pts, "
+              f"center={cluster_center.round(4)}{marker}")
+
+    # 4. Фильтруем: убираем кластеры-кубы
+    target_candidates = {k: v for k, v in cluster_info.items() if not v['is_cube']}
+
+    if not target_candidates:
+        print("[DUSt3R_GPU] Warning: All clusters excluded as cube. Returning non-ground points.")
+        pile_pts    = np.asarray(pcd_no_ground.points)
+        pile_colors = (np.asarray(pcd_no_ground.colors) * 255.0).astype(np.uint8)
+        return pile_pts, pile_colors, plane_oriented
+
+    # 5. Целевой объект = самый большой оставшийся кластер
+    target_id = max(target_candidates.keys(), key=lambda k: target_candidates[k]['count'])
+    target_info = target_candidates[target_id]
+    print(f"[DUSt3R_GPU] Target cluster: #{target_id} with {target_info['count']} pts "
+          f"(largest non-cube cluster)")
+
+    # 6. BBox вокруг целевого кластера (с запасом 5%)
+    target_mask = labels == target_id
+    target_down_pcd = pcd_down.select_by_index(np.where(target_mask)[0])
+
+    bbox = target_down_pcd.get_axis_aligned_bounding_box()
+    bbox.scale(1.05, bbox.get_center())
+
     pile_pcd = pcd_no_ground.crop(bbox)
-    print(f"[DUSt3R_GPU] Pile isolated: {len(pile_pcd.points)} points "
+    print(f"[DUSt3R_GPU] Target isolated: {len(pile_pcd.points)} points "
           f"({len(pile_pcd.points)/len(pts)*100:.1f}% of total)")
 
-    pile_pts = np.asarray(pile_pcd.points)
+    pile_pts    = np.asarray(pile_pcd.points)
     pile_colors = (np.asarray(pile_pcd.colors) * 255.0).astype(np.uint8)
-
-    return pile_pts, pile_colors
+    return pile_pts, pile_colors, plane_oriented
 
 
 # ---------------------------------------------------------------------------
-# Volume: Пуассон с фоллбэком на ConvexHull
+# Диагностика: фит сферы (для калибровочной полусферы)
+# ---------------------------------------------------------------------------
+
+def diagnose_sphere_fit(pts, scale_m_per_unit=None):
+    """
+    Диагностика: фитим сферу МНК в облако и считаем объём полусферы
+    аналитически. Заодно меряем радиус в метрах — чтобы понять,
+    врёт масштаб или врёт ConvexHull.
+    """
+    pts = np.asarray(pts, dtype=np.float64)
+
+    if OPEN3D_AVAILABLE:
+        _pcd = o3d.geometry.PointCloud()
+        _pcd.points = o3d.utility.Vector3dVector(pts)
+        _pcd, _ = _pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+        pts = np.asarray(_pcd.points)
+
+    # МНК сфера: x^2+y^2+z^2 = 2ax + 2by + 2cz + d
+    A = np.column_stack([2*pts[:, 0], 2*pts[:, 1], 2*pts[:, 2], np.ones(len(pts))])
+    f = (pts ** 2).sum(axis=1)
+    sol, *_ = np.linalg.lstsq(A, f, rcond=None)
+    a, b, c, d = sol
+    center  = np.array([a, b, c])
+    r_units = sqrt(d + a*a + b*b + c*c)
+
+    dists = np.linalg.norm(pts - center, axis=1)
+    rms   = float(np.sqrt(np.mean((dists - r_units) ** 2)))
+    vol_units = (2.0/3.0) * np.pi * r_units**3
+
+    print(f"[SPHERE_FIT] r={r_units:.5f} units | RMS={rms:.5f} ({rms/r_units*100:.1f}% от r)")
+    print(f"[SPHERE_FIT] полусфера = {vol_units:.6f} units^3")
+    if scale_m_per_unit:
+        r_m    = r_units * scale_m_per_unit
+        vol_m3 = vol_units * scale_m_per_unit ** 3
+        print(f"[SPHERE_FIT] r = {r_m*100:.1f} см  (ждём ~25.1 см)")
+        print(f"[SPHERE_FIT] объём = {vol_m3*1000:.2f} л  (ждём 33 л)")
+    return r_units
+
+
+# ---------------------------------------------------------------------------
+# Volume: интеграл высоты над опорной плоскостью (DEM / cut-and-fill)
+# ---------------------------------------------------------------------------
+
+def compute_volume_heightfield(pts, plane_model, scale_m_per_unit=None, cell_m=0.01):
+    """
+    Объём как интеграл высоты над опорной плоскостью.
+    Для каждой ячейки сетки в плоскости берём медианную высоту точек,
+    объём = Σ (высота ячейки * площадь ячейки).
+    Подходит для куч произвольной формы, устойчив к шуму у земли.
+
+    pts          — изолированные точки объекта
+    plane_model  — (a,b,c,d) опорной плоскости из RANSAC
+    cell_m       — размер ячейки сетки в метрах (по умолчанию 1 см)
+    """
+    pts = np.asarray(pts, dtype=np.float64)
+    a, b, c, d = plane_model
+    n = np.array([a, b, c], dtype=np.float64)
+    nn = np.linalg.norm(n)
+    n = n / nn
+    d = d / nn
+
+    # высота над плоскостью; нормаль должна смотреть в сторону объекта
+    h = pts.dot(n) + d
+    if np.median(h) < 0:
+        n, d, h = -n, -d, -h
+
+    # ортонормированный базис плоскости (e1, e2) перпендикулярно n
+    a_ref = np.array([1.0, 0.0, 0.0]) if abs(n[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    e1 = np.cross(n, a_ref); e1 /= np.linalg.norm(e1)
+    e2 = np.cross(n, e1)
+
+    u = pts.dot(e1)
+    v = pts.dot(e2)
+
+    # размер ячейки в единицах сцены
+    if scale_m_per_unit and scale_m_per_unit > 0:
+        cell = cell_m / scale_m_per_unit
+    else:
+        cell = (u.max() - u.min()) / 80.0  # ~80 ячеек по ширине
+
+    iu = np.floor((u - u.min()) / cell).astype(np.int64)
+    iv = np.floor((v - v.min()) / cell).astype(np.int64)
+    keys = iu * (iv.max() + 2) + iv
+
+    # высота ячейки = медиана высот точек в ней (устойчиво к выбросам),
+    # отрицательные высоты (шум под плоскостью) обнуляем
+    order  = np.argsort(keys)
+    keys_s = keys[order]
+    h_s    = h[order]
+    uniq, start = np.unique(keys_s, return_index=True)
+
+    cell_h = np.empty(len(uniq))
+    for i in range(len(uniq)):
+        s = start[i]
+        e = start[i + 1] if i + 1 < len(uniq) else len(h_s)
+        cell_h[i] = max(float(np.median(h_s[s:e])), 0.0)
+
+    cell_area = cell * cell
+    vol_units = float(np.sum(cell_h) * cell_area)
+    print(f"[HEIGHTFIELD] cells={len(uniq)} cell={cell:.5f} units "
+          f"({cell_m*100:.1f}cm) hmax={h.max():.4f} | vol={vol_units:.6f} units^3")
+    if scale_m_per_unit:
+        vol_m3 = vol_units * scale_m_per_unit ** 3
+        print(f"[HEIGHTFIELD] объём = {vol_m3*1000:.2f} л")
+    return vol_units
+
+
+# ---------------------------------------------------------------------------
+# Volume: Poisson с фоллбэком на ConvexHull
 # ---------------------------------------------------------------------------
 
 def compute_volume(pts):
+    """
+    Считает объём облака точек.
+
+    Метод: зеркалируем объект вниз (создаём замкнутую нижнюю границу),
+    строим Poisson mesh, считаем его объём / 2.
+    Если Poisson не дал watertight — падаем на ConvexHull.
+    """
     from scipy.spatial import ConvexHull
-    
-    # Отзеркаливаем кучу вниз для создания замкнутого объема
+
+    # Зеркалируем по дну объекта (создаём замкнутость снизу)
     z_min = pts[:, 2].min()
     mirrored = pts.copy()
     mirrored[:, 2] = 2 * z_min - mirrored[:, 2]
     full_pts = np.vstack([pts, mirrored])
 
-    # -- ПОПЫТКА ЧЕРЕЗ МЕШ ПУАССОНА --
     if OPEN3D_AVAILABLE:
         try:
             pcd = o3d.geometry.PointCloud()
             pcd.points = o3d.utility.Vector3dVector(full_pts)
-            
-            pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.05, max_nn=30))
+
+            pcd.estimate_normals(
+                search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.05, max_nn=30)
+            )
             pcd.orient_normals_consistent_tangent_plane(k=15)
-            
-            # Строим меш. Не обрезаем края по плотности, чтобы он остался watertight
+
             mesh, _ = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=9)
-            
+
             if mesh.is_watertight():
-                vol = mesh.get_volume() / 2.0  # Делим пополам из-за отзеркаливания
+                vol = mesh.get_volume() / 2.0
                 print(f"[DUSt3R_GPU] Volume calculated using Poisson Mesh: {vol:.6f} units")
                 return vol
             else:
@@ -301,7 +536,6 @@ def compute_volume(pts):
         except Exception as e:
             print(f"[DUSt3R_GPU] Poisson volume error: {e}. Falling back to ConvexHull.")
 
-    # -- РЕЗЕРВНЫЙ ВАРИАНТ ЧЕРЕЗ CONVEX HULL --
     hull = ConvexHull(full_pts)
     vol = hull.volume / 2.0
     print(f"[DUSt3R_GPU] Volume calculated using ConvexHull: {vol:.6f} units")
@@ -325,7 +559,7 @@ def save_ply(filepath, pts, colors):
 
 
 # ---------------------------------------------------------------------------
-# GLB mesh (Визуальный меш для вывода)
+# GLB mesh (визуальный меш для отображения)
 # ---------------------------------------------------------------------------
 
 def pointcloud_to_mesh(pts, colors, output_glb_path):
@@ -342,18 +576,18 @@ def pointcloud_to_mesh(pts, colors, output_glb_path):
     pcd = pcd.select_by_index(ind)
 
     bbox = np.asarray(pcd.get_max_bound()) - np.asarray(pcd.get_min_bound())
-    voxel_size = float(np.min(bbox)) * 0.005 
-    voxel_size = max(0.001, min(voxel_size, 0.02)) 
+    voxel_size = float(np.min(bbox)) * 0.005
+    voxel_size = max(0.001, min(voxel_size, 0.02))
     pcd = pcd.voxel_down_sample(voxel_size=voxel_size)
 
     normal_radius = voxel_size * 10
-    pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(
-        radius=normal_radius, max_nn=30))
+    pcd.estimate_normals(
+        search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=normal_radius, max_nn=30)
+    )
     pcd.orient_normals_consistent_tangent_plane(k=15)
 
     mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=10)
 
-    # Удаляем артефакты (визуальный меш перестает быть watertight, но выглядит красиво)
     densities = np.asarray(densities)
     vertices_to_remove = densities < np.quantile(densities, 0.15)
     mesh.remove_vertices_by_mask(vertices_to_remove)
@@ -375,18 +609,19 @@ def pointcloud_to_mesh(pts, colors, output_glb_path):
     print(f"[DUSt3R_GPU] Visual mesh saved to {output_glb_path} ({len(mesh.triangles)} faces)")
     return output_glb_path
 
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--image_dir",  required=True)
-    parser.add_argument("--output",     required=True)
-    parser.add_argument("--exif_json",  default=None)
-    parser.add_argument("--no_glb",     action="store_true")
-    # ТУТ ИЗМЕНЕНО: дефолтный размер стороны одного квадрата теперь 0.01775м (7.1см / 4)
-    parser.add_argument("--cube_square_m", type=float, default=0.01775)
+    parser.add_argument("--image_dir",     required=True)
+    parser.add_argument("--output",        required=True)
+    parser.add_argument("--exif_json",     default=None)
+    parser.add_argument("--no_glb",        action="store_true")
+    parser.add_argument("--cube_square_m", type=float, default=0.01775,
+                        help="Размер одной клетки куба в метрах (7.1см / 4 = 0.01775)")
     args = parser.parse_args()
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -405,25 +640,11 @@ def main():
         raise ValueError(f"Need at least 2 images, found {len(img_files)}")
     imgs = load_images(img_files, size=512)
 
-    gps_coords  = None
     known_focal = None
     if args.exif_json and os.path.exists(args.exif_json):
         with open(args.exif_json) as f:
             exif_list = json.load(f)
         known_focal = focal_px_from_exif(exif_list, dust3r_img_size=512)
-        sorted_exif = sorted(exif_list, key=lambda e: e.get("photo_index", 0))
-        gps_list = []
-        for entry in sorted_exif:
-            if not isinstance(entry, dict): continue
-            inner = entry.get("exif", entry)
-            if not isinstance(inner, dict): inner = entry
-            if not isinstance(inner, dict): continue
-            lat = inner.get("lat")
-            lon = inner.get("lon")
-            if lat is not None and lon is not None:
-                gps_list.append((lat, lon))
-        if len(gps_list) == len(img_files):
-            gps_coords = gps_list
 
     pairs = make_pairs(imgs, scene_graph='complete', prefilter=None, symmetrize=True)
     print("[DUSt3R_GPU] Running inference...")
@@ -431,6 +652,23 @@ def main():
 
     print("[DUSt3R_GPU] Global Alignment...")
     scene = global_aligner(output, device=device, mode=GlobalAlignerMode.PointCloudOptimizer)
+
+    # Фиксируем focal length из EXIF — не даём DUSt3R его "угадывать".
+    if known_focal is not None:
+        print(f"[DUSt3R_GPU] Fixing focal to EXIF value: {known_focal:.1f}px (freezing im_focals)")
+        try:
+            import torch as _torch
+            for i in range(len(imgs)):
+                scene.im_focals[i].data.fill_(known_focal)
+                # Проверяем, является ли тензор листовым, прежде чем менять requires_grad
+                if scene.im_focals[i].is_leaf:
+                    scene.im_focals[i].requires_grad_(False)
+            print("[DUSt3R_GPU] Optimizing: pw_poses / im_depthmaps / im_poses (focal FIXED)")
+        except Exception as e:
+            print(f"[DUSt3R_GPU] Could not fix focal: {e}")
+    else:
+        print("[DUSt3R_GPU] No EXIF focal — focal will be optimized freely")
+
     scene.compute_global_alignment(init='mst', niter=300, schedule='linear', lr=0.01)
 
     pts3d    = scene.get_pts3d()
@@ -450,63 +688,70 @@ def main():
     final_pts    = np.concatenate(all_pts,    axis=0)
     final_colors = np.concatenate(all_colors, axis=0)
 
-    # -- ПОИСК МАСШТАБА --
-    scale_cube = compute_scale_from_cube(
+    # -- ПОИСК МАСШТАБА ПО КУБУ (теперь возвращает и 3D-центры куба) --
+    scale_cube, cube_3d_centers = compute_scale_from_cube(
         img_files, pts3d_np, masks_np,
-        square_size_m=args.cube_square_m, pattern=(3, 3), dust3r_size=512
+        square_size_m=args.cube_square_m,
+        pattern=(3, 3),
+        dust3r_size=512
     )
 
-    scale_weighted, scale_median = None, None
-    if gps_coords is not None:
-        poses       = scene.get_im_poses().detach().cpu().numpy()
-        cam_centers = poses[:, :3, 3]
-        scale_weighted, scale_median = compute_scale_from_gps(gps_coords, cam_centers)
+    # --- ДОБАВЛЕНО: Объявляем переменные для дальнейшей логики ---
+    best_scale = scale_cube
+    scale_source = "cube" if best_scale is not None else None
+    # -------------------------------------------------------------
 
-    # Игнорируем GPS, если куб успешно найден (чтобы избежать огромной погрешности)
-    if scale_cube is not None:
-        print("[DUSt3R_GPU] Accurate cube scale found. Discarding GPS scales to prevent discrepancy.")
-        scale_weighted = None
-        scale_median   = None
+    # Финальный sanity check на best_scale
+    SCALE_MIN, SCALE_MAX = 0.001, 20.0 # Расширяем лимит
+    if best_scale is not None and not (SCALE_MIN <= best_scale <= SCALE_MAX):
+        print(f"[DUSt3R_GPU] WARNING: best_scale={best_scale:.4f} is outside "
+              f"plausible range [{SCALE_MIN}, {SCALE_MAX}]. "
+              f"Volume in m3 will NOT be calculated to avoid garbage output.")
+        best_scale   = None
+        scale_source = None
 
-    best_scale = scale_cube if scale_cube is not None else scale_weighted
-    scale_source = "cube" if scale_cube is not None else ("gps_weighted" if scale_weighted else None)
-
-    # -- ИЗОЛЯЦИЯ КУЧИ --
-    print("[DUSt3R_GPU] Isolating target material from scene...")
-    clean_pts, clean_colors = isolate_pile(final_pts, final_colors)
+    # -- ИЗОЛЯЦИЯ ЦЕЛЕВОГО ОБЪЕКТА (куб явно исключается) --
+    print("[DUSt3R_GPU] Isolating target object from scene...")
+    clean_pts, clean_colors, ground_plane = isolate_target_object(
+        final_pts, final_colors,
+        scale_m_per_unit=best_scale,
+        cube_3d_centers=cube_3d_centers if cube_3d_centers else None
+    )
     if len(clean_pts) > 100:
-        final_pts = clean_pts
+        final_pts    = clean_pts
         final_colors = clean_colors
 
-    # -- РАСЧЕТ ОБЪЕМА --
-    volume_units  = None
-    volume_m3     = None
-    volume_m3_med = None
+    # -- ДИАГНОСТИКА: фит сферы (для калибровочной полусферы) --
+    diagnose_sphere_fit(final_pts, scale_m_per_unit=best_scale)
+
+    # -- РАСЧЁТ ОБЪЁМА: интеграл высоты над опорной плоскостью --
+    volume_units = None
+    volume_m3    = None
 
     try:
-        # Теперь считаем объем по обновленной логике (Mesh Poisson / ConvexHull)
-        volume_units = compute_volume(final_pts)
+        if ground_plane is not None:
+            volume_units = compute_volume_heightfield(
+                final_pts, ground_plane,
+                scale_m_per_unit=best_scale, cell_m=0.01
+            )
+        else:
+            print("[DUSt3R_GPU] No ground plane — fallback to ConvexHull")
+            volume_units = compute_volume(final_pts)
 
-        if best_scale is not None:
+        if best_scale is not None and volume_units is not None:
             volume_m3 = volume_units * (best_scale ** 3)
-            print(f"[DUSt3R_GPU] Volume ({scale_source}): {volume_m3:.3f} m3")
-
-        if scale_median is not None:
-            volume_m3_med = volume_units * (scale_median ** 3)
-
-    except ImportError:
-        print("[DUSt3R_GPU] scipy missing: pip install scipy")
+            print(f"[DUSt3R_GPU] Volume ({scale_source}): {volume_m3:.4f} m3 "
+                  f"= {volume_m3 * 1000:.2f} litres")
     except Exception as e:
         print(f"[DUSt3R_GPU] Volume error: {e}")
 
-    # Сохраняем в PLY только очищенную кучу
     save_ply(args.output, final_pts, final_colors)
 
     ply_base64 = None
     try:
         with open(args.output, "rb") as f:
             ply_base64 = base64.b64encode(f.read()).decode("utf-8")
-    except Exception as e:
+    except Exception:
         pass
 
     glb_base64    = None
@@ -525,25 +770,25 @@ def main():
         "status":              "success",
         "point_count":         len(final_pts),
         "scale_cube":          round(scale_cube,     4) if scale_cube     is not None else None,
-        "scale_weighted":      round(scale_weighted, 4) if scale_weighted is not None else None,
-        "scale_median":        round(scale_median,   4) if scale_median   is not None else None,
         "scale_source":        scale_source,
         "volume_dust3r_units": round(volume_units,   6) if volume_units   is not None else None,
         "volume_m3":           round(volume_m3,      4) if volume_m3      is not None else None,
-        "volume_m3_weighted":  round(volume_m3,      3) if (volume_m3 is not None and scale_source != "cube") else None,
-        "volume_m3_median":    round(volume_m3_med,  3) if volume_m3_med  is not None else None,
+        "volume_litres":       round(volume_m3 * 1000, 2) if volume_m3    is not None else None,
+        "cube_found_on_n_photos": len(cube_3d_centers),
         "ply_file":            args.output,
         "ply_base64":          ply_base64,
         "glb_file":            glb_file_path,
         "glb_base64":          glb_base64,
     }
+
     result_path = args.output.replace(".ply", "_result.json")
     with open(result_path, 'w') as f:
         json.dump(result, f, indent=2)
-    
+
     log_result = {k: v for k, v in result.items() if k not in ["ply_base64", "glb_base64"]}
     print(json.dumps(log_result))
     print("[DUSt3R_GPU] Done!")
+
 
 if __name__ == '__main__':
     main()
